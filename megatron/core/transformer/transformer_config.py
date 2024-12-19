@@ -326,6 +326,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
+    moe_granularity: int = 1
+    """Granularity of fine-grained MoE. Please refer to https://arxiv.org/abs/2402.07871 for more details."""
+
+    moe_relu_routing: bool = False
+    """Use ReLU as the routing function for MoE."""
+
+    moe_relu_l1_reg_coeff_init: float = 1e-8
+    """Initial value of L1 regularization coefficient for ReLU routing (\lambda_0 in the paper)."""
+
+    moe_relu_l1_reg_coeff_multiplier: float = 1.2
+    """Multiplier for the L1 regularization coefficient for ReLU routing (\alpha in the paper)."""
+
     ##################
     # Context Parallel
     ##################
@@ -593,6 +605,20 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        if self.moe_granularity > 1 and self.num_moe_experts:
+            if self.moe_ffn_hidden_size % self.moe_granularity != 0:
+                raise ValueError(
+                    f"moe_ffn_hidden_size ({self.moe_ffn_hidden_size}) must be divisible by "
+                    f"moe_granularity ({self.moe_granularity})."
+                )
+            print(f"Using fine-grained MoE with granularity: {self.moe_granularity}, "
+                    f"increase num_moe_experts to {self.num_moe_experts * self.moe_granularity}, "
+                    f"increase moe_router_topk to {self.moe_router_topk * self.moe_granularity}, "
+                    f"decrease moe_ffn_hidden_size to {self.moe_ffn_hidden_size // self.moe_granularity}.")
+            self.num_moe_experts *= self.moe_granularity
+            self.moe_router_topk *= self.moe_granularity
+            self.moe_ffn_hidden_size //= self.moe_granularity
 
 
 @dataclass

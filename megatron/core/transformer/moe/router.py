@@ -303,3 +303,141 @@ class TopKRouter(Router):
         scores, routing_map = self.routing(logits)
 
         return scores, routing_map
+
+
+class ReLURouter(Router):
+    """Route each token to the experts with non-zero relu outputs."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        """Initialize the relu router.
+
+        Args:
+            config (TransformerConfig): The configuration for the transformer model.
+        """
+        super().__init__(config=config)
+        self.topk = self.config.moe_router_topk
+        # self.target_sparsity = 1 - self.topk / self.num_experts
+        self.input_jitter = None
+
+    def apply_input_jitter(self, input: torch.Tensor):
+        """Add noise to the input tensor.
+        Refer to https://arxiv.org/abs/2101.03961.
+
+        Args:
+            input (Tensor): Input tensor.
+
+        Returns:
+            Tensor: Jittered input.
+        """
+        if self.config.moe_input_jitter_eps is not None:
+            eps = self.config.moe_input_jitter_eps
+            if self.input_jitter is None:
+                self.input_jitter = torch.distributions.uniform.Uniform(
+                    torch.tensor(1.0 - eps, device=input.device),
+                    torch.tensor(1.0 + eps, device=input.device),
+                ).rsample
+            return input * self.input_jitter(input.shape)
+        else:
+            return input
+
+    def l1_reg_load_balancing(self, logits: torch.Tensor):
+        """Apply load balancing L1 regularization loss to the ReLU output.
+
+        Args:
+            logits (torch.Tensor): Logits tensor after gating, shape: [num_tokens, num_experts].
+
+        Returns:
+            probs (torch.Tensor): The probabilities of token to experts assignment, shape [num_tokens, num_experts].
+            routing_map (torch.Tensor): The mapping of token to experts assignment, shape [num_tokens, num_experts].
+        """
+        probs = torch.relu(logits)
+        routing_map = probs > 0
+        if self.training and torch.is_grad_enabled():
+            num_local_tokens_per_expert = routing_map.sum(dim=0)
+            # Apply l1 regularization
+            probs = self.apply_l1_reg(probs, num_local_tokens_per_expert, activation=probs)
+            # Record the sparsity of the ReLU output
+            sparsity = 1 - routing_map.sum().float() / routing_map.numel()
+            self.config.moe_relu_sparsity += sparsity
+        return probs, routing_map
+
+    def apply_l1_reg(self, probs: torch.Tensor, num_local_tokens_per_expert: torch.Tensor, activation: torch.Tensor):
+        """Apply load balancing L1 regularization loss to the ReLU output.
+
+        Args:
+            probs (torch.Tensor): The probs output by the router for each token.
+                [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
+                [num_experts]
+            activation (torch.Tensor): The activation tensor to attach the gradient function to.
+
+        Returns:
+            torch.Tensor: The activation tensor with the attached gradient function.
+        """
+        l1_reg_coeff = self.config.moe_relu_l1_reg_coeff.item()
+
+        sequence_partition_group = None
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
+            sequence_partition_group = parallel_state.get_context_parallel_group()
+            l1_reg_coeff /= parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+
+        # L1 regularization with load balancing shares the same formula with switch load balancing loss:
+        # l1_reg = sum((probs_per_expert/num_tokens) *
+        # (tokens_per_expert/(num_tokens*topk))) * num_experts * l1_reg_coeff.
+        l1_reg = switch_load_balancing_loss_func(
+            probs,
+            num_local_tokens_per_expert,
+            self.topk,
+            l1_reg_coeff,
+            sequence_partition_group=sequence_partition_group,
+        )
+
+        save_to_aux_losses_tracker(
+            "l1_reg_loss",
+            l1_reg / l1_reg_coeff,
+            self.layer_number,
+            self.config.num_layers,
+            reduce_group=sequence_partition_group,
+        )
+        activation = MoEAuxLossAutoScaler.apply(activation, l1_reg)
+        return activation
+
+    def routing(self, logits: torch.Tensor):
+        """ReLU routing function
+
+        Args:
+            logits (torch.Tensor): Logits tensor after gating, shape: [num_tokens, num_experts].
+
+        Returns:
+            probs (torch.Tensor): The probabilities of token to experts assignment, shape [num_tokens, num_experts].
+            routing_map (torch.Tensor): The mapping of token to experts assignment, shape [num_tokens, num_experts].
+        """
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
+            # Gather the logits from the TP region
+            logits = gather_from_sequence_parallel_region(logits)
+
+        scores, routing_map = self.l1_reg_load_balancing(logits)
+
+        return scores, routing_map
+
+    def forward(self, input: torch.Tensor):
+        """
+        Forward pass of the router.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+        """
+        self.hidden = input.shape[-1]
+
+        # Apply input jitter
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        scores, routing_map = self.routing(logits)
+
+        return scores, routing_map

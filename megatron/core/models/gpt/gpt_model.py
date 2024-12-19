@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, tensor_parallel
@@ -163,6 +164,14 @@ class GPTModel(LanguageModule):
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
+        # Special handling for ReMoE
+        if self.config.moe_relu_routing:
+            moe_relu_l1_reg_coeff = torch.tensor(self.config.moe_relu_l1_reg_coeff_init, dtype=torch.float32, device=torch.cuda.current_device(), requires_grad=False)
+            self.register_buffer("moe_relu_l1_reg_coeff", moe_relu_l1_reg_coeff)
+            setattr(self.config, "moe_relu_l1_reg_coeff", moe_relu_l1_reg_coeff)
+            moe_relu_sparsity = torch.zeros(1, dtype=torch.float32, device=torch.cuda.current_device(), requires_grad=False)
+            setattr(self.config, "moe_relu_sparsity", moe_relu_sparsity)
+
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
@@ -306,4 +315,17 @@ class GPTModel(LanguageModule):
             output_extra_state and output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
+        # Save buffers (specifically, moe_relu_l1_reg_coeff)
+        for name, buffer in self.named_buffers():
+            sharded_state_dict[f'{prefix}{name}'] = buffer
+
         return sharded_state_dict
+
+    # override half() and bfloat16() to keep moe_relu_l1_reg_coeff in fp32
+    def half(self):
+        exclude_id = [id(self.moe_relu_l1_reg_coeff)] if hasattr(self, "moe_relu_l1_reg_coeff") else []
+        return self._apply(lambda t: t.half() if t.is_floating_point() and id(t) not in exclude_id else t)
+
+    def bfloat16(self):
+        exclude_id = [id(self.moe_relu_l1_reg_coeff)] if hasattr(self, "moe_relu_l1_reg_coeff") else []
+        return self._apply(lambda t: t.bfloat16() if t.is_floating_point() and id(t) not in exclude_id else t)

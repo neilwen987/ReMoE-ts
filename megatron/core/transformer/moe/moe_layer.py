@@ -10,7 +10,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import TopKRouter, ReLURouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -85,7 +85,10 @@ class MoELayer(BaseMoELayer):
         self.moe_layer_recompute = config.moe_layer_recompute
 
         # Initialize router
-        self.router = TopKRouter(config=self.config)
+        if config.moe_relu_routing:
+            self.router = ReLURouter(config=self.config)
+        else:
+            self.router = TopKRouter(config=self.config)
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":

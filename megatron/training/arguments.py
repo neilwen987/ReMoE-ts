@@ -20,7 +20,7 @@ from megatron.core.models.retro.utils import (
 )
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import is_torch_min_version, get_torch_version
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
@@ -2123,6 +2123,14 @@ def _add_moe_args(parser):
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+    # Granular Expert Arguments
+    group.add_argument('--moe-granularity', type=int, default=1,
+                       help='Granularity of fine-grained MoE. The default is 1.')
+    # ReMoE arguments
+    group.add_argument('--moe-relu-routing', action='store_true',
+                       help='Use ReLU as the routing function for MoE.')
+    group.add_argument('--moe-relu-l1-reg-coeff-init', type=float, default=1e-8)
+    group.add_argument('--moe-relu-l1-reg-coeff-multiplier', type=float, default=1.2)
 
     return parser
 

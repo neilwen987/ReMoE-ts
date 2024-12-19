@@ -832,7 +832,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad, moe_relu_sparsity, moe_relu_l1_reg_coeff):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -974,6 +974,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                               args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if moe_relu_sparsity is not None:
+            writer.add_scalar('moe_relu_sparsity', moe_relu_sparsity, iteration)
+            writer.add_scalar('moe_relu_sparsity vs samples', moe_relu_sparsity,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'moe_relu_sparsity': moe_relu_sparsity}, iteration)
+        if moe_relu_l1_reg_coeff is not None:
+            writer.add_scalar('moe_relu_l1_reg_coeff', moe_relu_l1_reg_coeff, iteration)
+            writer.add_scalar('moe_relu_l1_reg_coeff vs samples', moe_relu_l1_reg_coeff,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'moe_relu_l1_reg_coeff': moe_relu_l1_reg_coeff}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1053,6 +1065,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             log_string += f' num zeros: {num_zeros_in_grad} |'
         if params_norm is not None:
             log_string += f' params norm: {params_norm:.3f} |'
+        if moe_relu_sparsity is not None:
+            log_string += f' moe relu sparsity: {moe_relu_sparsity:.4f} |'
+        if moe_relu_l1_reg_coeff is not None:
+            log_string += f' moe relu l1 reg coeff: {moe_relu_l1_reg_coeff:.4E} |'
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -1457,6 +1473,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        # Zero the sparsity buffer if using ReLU router
+        if config.moe_relu_routing:
+            config.moe_relu_sparsity.zero_()
+
         # Run training step.
         args.curr_iteration = iteration
         loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
@@ -1466,6 +1486,27 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        optimizer,
                        opt_param_scheduler,
                        config)
+        
+        moe_relu_sparsity = None
+        moe_relu_l1_reg_coeff = None
+        # Update the l1 regularization coefficient if using ReLU router
+        if config.moe_relu_routing:
+            # calculate the average sparsity
+            config.moe_relu_sparsity /= config.num_layers * num_microbatches
+            # average across all data parallel ranks
+            torch.distributed.all_reduce(config.moe_relu_sparsity, group=mpu.get_data_parallel_group(), op=torch.distributed.ReduceOp.SUM)
+            config.moe_relu_sparsity /= torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+            # sum across all pipeline parallel ranks
+            torch.distributed.all_reduce(config.moe_relu_sparsity, group=mpu.get_pipeline_model_parallel_group(), op=torch.distributed.ReduceOp.SUM)
+            # zeroth-order update to the coefficient based on the average sparsity
+            target_sparsity = 1 - config.moe_router_topk / config.num_moe_experts
+            if config.moe_relu_sparsity < target_sparsity:
+                config.moe_relu_l1_reg_coeff *= config.moe_relu_l1_reg_coeff_multiplier
+            else:
+                config.moe_relu_l1_reg_coeff /= config.moe_relu_l1_reg_coeff_multiplier
+            moe_relu_sparsity = config.moe_relu_sparsity.item()
+            moe_relu_l1_reg_coeff = config.moe_relu_l1_reg_coeff.item()
+
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
@@ -1524,7 +1565,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad, moe_relu_sparsity, moe_relu_l1_reg_coeff)
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and \
