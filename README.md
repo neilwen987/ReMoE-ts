@@ -2,7 +2,13 @@
 
 ReMoE
 ===========================
-<h4>Codebase for the paper "ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing"</h4>
+<h4>
+  Codebase for the paper 
+  <a href="https://arxiv.org/pdf/2412.14711">
+    "ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing"
+  </a>
+</h4>
+
 
 
 ![ReMoE scaling](images/remoe_scaling.png)
@@ -73,3 +79,14 @@ Run the following script for pretraining ReMoE models:
     bash scripts/train_llama_182m_remoe.sh
     ```
     MoE and dense models can be trained in similar ways. Please refer to the [scripts](scripts) directory for more details.
+
+### Citation:
+If you find this work useful, please consider citing:
+```bibtex
+@article{wang2024remoe,
+      title={ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing}, 
+      author={Ziteng Wang and Jianfei Chen and Jun Zhu},
+      journal={arXiv preprint arXiv:2412.14711},
+      year={2024}
+}
+```
