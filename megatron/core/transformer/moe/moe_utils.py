@@ -348,7 +348,7 @@ def sp_topk_softmax_with_capacity(
     if use_pre_softmax:
         # Pre softmax
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits).view(batch_size, Seq_length, -1)  # (N, Seq_length, Expert)
-        _,top1_indices = torch.topk(scores, k = 2, dim=-1)
+        _,top1_indices = torch.topk(scores, k = 1, dim=-1)
 
         _, flat_indices = torch.topk(scores.view(batch_size, -1), k = Seq_length * topk, dim=1)
         
