@@ -309,6 +309,103 @@ def topk_softmax_with_capacity(
         return final_probs, final_map, tokens_per_expert
 
 
+
+def sp_topk_softmax_with_capacity(
+    logits: torch.Tensor,
+    topk: int,
+    batch_size : int,
+    Seq_length : int,
+    capacity_factor: Optional[float] = None,
+    pad_to_capacity: bool = False,
+    drop_policy: str = "probs",
+    use_pre_softmax: bool = False,
+    deterministic_mode: bool = False,
+    
+):
+    """Apply capacity and padding to the top-k selection.
+    Args:
+        logits (torch.Tensor): Logits tensor.
+        topk (int): The number of experts to select for each token.
+        capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number
+                               of tokens exceeds the capacity.
+        pad_to_capacity (bool): Whether to need padding in token drop mode.
+        drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
+                           If "prob", the tokens with the lowest probabilities will be dropped.
+                           If "position", tokens at the end of each batch will be dropped.
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
+              the routing probabilities for each token to each expert.
+            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
+              indicating which experts were selected for each token. True values represent
+              the selected experts.
+            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
+              the number of local tokens assigned to each expert.
+    """
+    assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+    num_tokens = logits.shape[0]
+    num_experts = logits.shape[1]
+    if use_pre_softmax:
+        # Pre softmax
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits).view(batch_size, Seq_length, -1)  # (N, Seq_length, Expert)
+        _,top1_indices = torch.topk(scores, k = 2, dim=-1)
+
+        _, flat_indices = torch.topk(scores.view(batch_size, -1), k = Seq_length * topk, dim=1)
+        
+        select_mask = torch.zeros_like(scores.view(batch_size,-1), dtype = torch.bool).scatter_(-1, flat_indices, True).reshape(scores.shape)
+        select_mask.scatter_(-1, top1_indices, True)
+        expert_counts = (select_mask > 0).sum(dim=-1) 
+        max_experts_per_token = expert_counts.max()
+        filtered_scores = (scores * select_mask.detach()).view(-1,num_experts)
+        probs, top_indices = torch.topk(filtered_scores, k=max_experts_per_token, dim=1)
+    else:
+        # Post softmax
+        if topk == 1:
+            # Requires applying softmax before selecting the top-k when k is 1,
+            # since softmax on a [num_tokens, 1] would yield a zero gradient.
+            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
+        scores, top_indices = torch.topk(logits, k=topk, dim=1)
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+
+    # TODO Try using element-wise operations instead of scatter?
+    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool() * select_mask.view(-1, num_experts)
+    tokens_per_expert = topk_map.sum(dim=0)
+
+    if capacity_factor is None:
+        # TopK without capacity
+        return topk_masked_gates, topk_map, tokens_per_expert
+    else:
+        # TopK with capacity
+        expert_capacity = get_capacity(
+            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
+        )
+
+        # Maskout exceeded tokens
+        if drop_policy == "probs":
+            _, capacity_indices = torch.topk(
+                topk_masked_gates, k=expert_capacity, dim=0, sorted=False
+            )
+            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
+        elif drop_policy == "position":
+            _, capacity_indices = torch.topk(topk_map.int(), k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
+        else:
+            raise ValueError(f"Invalid drop_policy: {drop_policy}")
+
+        if pad_to_capacity:
+            final_map = capacity_mask
+            final_probs = topk_masked_gates * final_map
+        else:
+            # Get exceed mask and maskout exceeded probs and indices
+            final_map = torch.logical_and(topk_map, capacity_mask)
+            final_probs = topk_masked_gates * final_map
+        return final_probs, final_map, tokens_per_expert
+
+
+
+
+
 def save_to_aux_losses_tracker(
     name: str,
     loss: torch.Tensor,

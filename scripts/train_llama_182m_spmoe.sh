@@ -6,17 +6,17 @@ export WANDB_API_KEY="1532edc16234575030f74f9a5edbfa977ec1ee4b"
 
 GPUS_PER_NODE=${1:-"8"}
 MASTER_ADDR=${MASTER_ADDR:-"localhost"}
-MASTER_PORT=${MASTER_PORT:-"6002"}
+MASTER_PORT=${MASTER_PORT:-"6007"}
 NNODES=${SLURM_NNODES:-"1"}
 NODE_RANK=${RANK:-"0"}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-# 256 * 1k * 38k = 10b tokens. 40000
+# 256 * 1k * 38k = 10b tokens. 20000
 TRAIN_ITERS=${2:-"20000"}
 MICRO_BATCH_SIZE=${3:-"8"}
 NUM_EXPERTS=${4:-"8"}
 GRANULARITY=${5:-"1"}
-PROJECT_NAME="${6:-"MOE-Topk-182M-$(date +%m%d-%H%M%S)"}"
+PROJECT_NAME="${6:-"MOE-SPTopk2-182M-$(date +%m%d-%H%M%S)"}"
 NUM_TOPK=${7:-"2"}
 CHECKPOINT_PATH="./logs/$PROJECT_NAME"
 mkdir -p $CHECKPOINT_PATH
@@ -123,6 +123,7 @@ MOE_ARGS=(
     --overlap-param-gather
     --overlap-grad-reduce
     --moe-router-pre-softmax
+    --moe-sample-routing
     --moe-grouped-gemm
     --moe-layer-recompute
     --moe-granularity $GRANULARITY

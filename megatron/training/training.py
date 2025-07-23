@@ -1792,10 +1792,13 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
-            if wandb_writer and is_last_rank():
-                wandb_writer.log({
-                    '{} validation'.format(key): total_loss_dict[key].item()},
-                    iteration)
+            if wandb_writer:
+                # 处理loss_dict中的tuple格式 (loss_value, num_tokens)
+                if isinstance(total_loss_dict[key], tuple):
+                    loss_value = total_loss_dict[key][0]  # 取tuple的第一个元素（实际的loss值）
+                else:
+                    loss_value = total_loss_dict[key]
+                wandb_writer.log({key: loss_value}, iteration)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)

@@ -13,6 +13,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_softmax_with_capacity,
+    sp_topk_softmax_with_capacity,
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -437,6 +438,101 @@ class ReLURouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
         logits = logits.view(-1, self.config.num_moe_experts)
+
+        scores, routing_map = self.routing(logits)
+
+        return scores, routing_map
+
+
+class SampleTopKRouter(TopKRouter):
+    """Sample Top-k router."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config)
+
+    def aux_loss_load_balancing(self, logits: torch.Tensor,B=None,S=None):
+        """Apply loss-based load balancing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
+
+        Returns:
+            probs (torch.Tensor): The probabilities of token to experts assignment.
+            indices (torch.Tensor): The mask of token to experts assignment.
+        """
+        probs, routing_map, tokens_per_expert = sp_topk_softmax_with_capacity(
+            logits,
+            self.topk,
+            batch_size = B,
+            Seq_length = S,
+            capacity_factor=self.config.moe_expert_capacity_factor,
+            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            drop_policy=self.config.moe_token_drop_policy,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            deterministic_mode=self.config.deterministic_mode,
+
+        )
+
+        if self.training:
+            # Apply load balancing loss
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Sample Top-k routing function
+
+        Args:
+            logits (torch.Tensor): Logits tensor after gating.
+
+        Returns:
+            probs (torch.Tensor): The probabilities of token to experts assignment.
+            routing_map (torch.Tensor): The mapping of token to experts assignment,
+                with shape [num_tokens, num_experts].
+        """
+        S,B,E = logits.shape
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        # Apply Z-Loss
+        logits = self.apply_z_loss(logits)
+
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
+            # Gather the logits from the TP region
+            logits = gather_from_sequence_parallel_region(logits)
+
+        if self.routing_type == "sinkhorn":
+            scores, routing_map = self.sinkhorn_load_balancing(logits)
+        elif self.routing_type == "aux_loss":
+            scores, routing_map = self.aux_loss_load_balancing(logits, B, S,)
+        elif self.routing_type == "none":
+            # A naive top-k routing without load balancing
+            scores, routing_map, _ = topk_softmax_with_capacity(
+                logits,
+                self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                deterministic_mode=self.config.deterministic_mode,
+            )
+        else:
+            raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
+
+        return scores, routing_map
+
+    def forward(self, input: torch.Tensor):
+        """
+        Forward pass of the router.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+        """
+        self.hidden = input.shape[-1]
+
+        # Apply input jitter
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+        # logits = logits.view(-1, self.config.num_moe_experts)
 
         scores, routing_map = self.routing(logits)
 

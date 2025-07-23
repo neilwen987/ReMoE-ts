@@ -329,6 +329,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_granularity: int = 1
     """Granularity of fine-grained MoE. Please refer to https://arxiv.org/abs/2402.07871 for more details."""
 
+    moe_sample_routing: bool = False
+    """Use Sample Top-k routing for MoE."""
+    
     moe_relu_routing: bool = False
     """Use ReLU as the routing function for MoE."""
 

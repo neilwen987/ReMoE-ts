@@ -2132,6 +2132,10 @@ def _add_moe_args(parser):
     group.add_argument('--moe-relu-l1-reg-coeff-init', type=float, default=1e-8)
     group.add_argument('--moe-relu-l1-reg-coeff-multiplier', type=float, default=1.2)
 
+    # Sample Top-k arguments
+    group.add_argument('--moe-sample-routing', action='store_true',
+                   help='Use Sample Top-k routing for MoE.')
+
     return parser
 
 def _add_mla_args(parser):
