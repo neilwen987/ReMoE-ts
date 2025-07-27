@@ -3,6 +3,8 @@
 """GPT zero-shot evaluation."""
 
 import math
+import os, json                    # 新增
+from tqdm import tqdm              # ── 新增
 
 import torch
 
@@ -26,9 +28,98 @@ from megatron.training import get_model
 from megatron.training.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.core.pipeline_parallel.p2p_communication import recv_forward, send_forward
 from megatron.training.arguments import core_transformer_config_from_args
+# RACE 不用现成 dataloader，所以放在最下方自定义函数
 from tasks.finetune_utils import build_data_loader
-
 from .datasets import build_dataset
+
+########################################
+# -----------  RACE 工具函数 -----------
+########################################
+
+def _iter_race_samples(race_root, split):
+    """
+    读取由 `tasks/data/get_race.py` 生成的 `{split}.json`：
+        • 可能放在  {race_root}/{split}.json
+        • 也可能放在  {race_root}/{split}/{split}.json
+    文件内容是一个 list，每条元素包含：
+        {
+          "article": str,
+          "questions": [q1, q2, ...],
+          "options":   [[c1,c2,c3,c4], ...],
+          "answers":   ["A","B",...]
+        }
+    """
+
+    # 1) 优先尝试二级目录（get_race.py 的默认输出）
+    file_path = os.path.join(race_root, split, f"{split}.json")
+    # 2) 回退到一级文件
+    if not os.path.isfile(file_path):
+        file_path = os.path.join(race_root, f"{split}.json")
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Cannot locate RACE split file: {file_path}")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    for data in dataset:
+        art = data["article"]
+        for i, q in enumerate(data["questions"]):
+            yield {
+                "article": art,
+                "question": q,
+                "choices": data["options"][i],
+                "label": ord(data["answers"][i]) - ord("A"),
+            }
+
+@torch.no_grad()
+def _choice_score(model, prefix_ids, choice_ids, eod_id):
+    ids = prefix_ids + choice_ids
+    tokens = torch.tensor(ids, device="cuda").unsqueeze(0)
+    attention_mask = (tokens != eod_id).long()
+    _, _, position_ids = get_ltor_masks_and_position_ids(
+        tokens, eod_id, False, False, False
+    )
+    logits = model(tokens, position_ids=position_ids, attention_mask=attention_mask)
+    logp = 0.0
+    for idx, tid in enumerate(choice_ids, start=len(prefix_ids) - 1):
+        logp += torch.log_softmax(logits[0, idx], -1)[tid].item()
+    return logp
+
+def _predict_race_sample(model, tokenizer, eod_id, sample, max_ctx=1024):
+    art = sample["article"]
+    q = sample["question"]
+    choices = sample["choices"]
+    prefix = f"Article: {art}\nQuestion: {q}\nAnswer:"
+    prefix_ids = tokenizer.tokenize(prefix,)[-max_ctx:]
+
+    scores = []
+    for ch in choices:
+        ch_ids = tokenizer.tokenize(" " + ch,)
+        scores.append(_choice_score(model, prefix_ids, ch_ids, eod_id))
+    return int(max(range(4), key=lambda i: scores[i]))
+
+def _evaluate_race(model, tokenizer, race_root, split="test"):
+    model.eval()
+    eod_id = tokenizer.eod
+    correct = torch.tensor(0.0, device="cuda")
+    total = torch.tensor(0.0, device="cuda")
+    sample_iter = _iter_race_samples(race_root, split)
+    # 仅在最后一个 rank 上显示进度条，避免多个进度条互相干扰
+    if is_last_rank():
+        sample_iter = tqdm(sample_iter, desc=f'RACE-{split}')
+
+    for sample in sample_iter:
+        if _predict_race_sample(model, tokenizer, eod_id, sample,) == sample["label"]:
+            correct += 1
+        total += 1
+
+    # 汇总到 data-parallel group
+    torch.distributed.all_reduce(correct)
+    torch.distributed.all_reduce(total)
+    acc = (correct / total).item() if total.item() > 0 else 0.0
+    return acc
+
+#######################################
 
 
 def get_model_provider(eval_metric):
@@ -249,6 +340,8 @@ def main():
         eval_metric = 'accuracy'
     elif args.task == 'WIKITEXT103':
         eval_metric = 'loss'
+    elif args.task == 'RACE':                # 新增分支
+        eval_metric = 'accuracy'
     else:
         raise NotImplementedError('{} task is not implemented.'.format(
             args.task))
@@ -261,12 +354,20 @@ def main():
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
-    # Data stuff.
-    dataset = build_dataset(args.task)
-    dataloader = build_data_loader(dataset, args.micro_batch_size,
-                                   args.num_workers, drop_last=False)
-
-    # Run evaluation.
-    evaluate_and_print_results(args.task, dataloader, model, eval_metric)
+    # -------------------- RACE 路径 --------------------
+    if args.task == 'RACE':
+        tokenizer = get_tokenizer()
+        # RACE 根目录默认取 valid_data[0]；若未提供则假设 ./RACE
+        race_root = args.valid_data[0] if args.valid_data else './RACE'
+        eval_split = 'test'
+        acc = _evaluate_race(model, tokenizer, race_root, split=eval_split)
+        if is_last_rank():
+            print_rank_0(f'RACE {eval_split} accuracy: {acc:.4%}')
+    # ---------------- 其余零 shot 任务 -----------------
+    else:
+        dataset = build_dataset(args.task)
+        dataloader = build_data_loader(dataset, args.micro_batch_size,
+                                       args.num_workers, drop_last=False)
+        evaluate_and_print_results(args.task, dataloader, model, eval_metric)
 
     print_rank_0('done :-)')
