@@ -11,7 +11,17 @@ from megatron.training import print_rank_0, is_last_rank
 from megatron.training import get_tokenizer
 from megatron.core import parallel_state, tensor_parallel
 from megatron.training.checkpointing import load_checkpoint
-from megatron.legacy.model import GPTModel
+# 根据参数动态选择 GPTModel 实现
+# Legacy 与 MCore 两种 GPTModel
+from megatron.legacy.model import GPTModel as LegacyGPTModel
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+# 构造 MCore 层规格
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec,
+    get_gpt_decoder_block_spec,
+)
+from importlib import import_module
 from megatron.training import get_model
 from megatron.training.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.core.pipeline_parallel.p2p_communication import recv_forward, send_forward
@@ -38,9 +48,61 @@ def get_model_provider(eval_metric):
             raise NotImplementedError('output type for {} evaluation metric '
                                       'is not supported.'.format(eval_metric))
 
-        print_rank_0('building GPT model ...')
-        model = GPTModel(config, num_tokentypes=0, parallel_output=parallel_output,
-                         pre_process=pre_process, post_process=post_process)
+        args = get_args()
+
+        # 1) Legacy 路径
+        if args.use_legacy_models:
+            print_rank_0('building Legacy GPT model ...')
+            model = LegacyGPTModel(
+                config,
+                num_tokentypes=0,
+                parallel_output=parallel_output,
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+            return model
+
+        # 2) MCore 路径
+        use_te = args.transformer_impl == "transformer_engine"
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            if args.num_experts:
+                transformer_layer_spec = get_gpt_decoder_block_spec(
+                    config, use_transformer_engine=use_te
+                )
+            else:
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                    )
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                    )
+
+        print_rank_0('building MCore GPT model ...')
+        model = MCoreGPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            parallel_output=parallel_output,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
+        )
 
         return model
 
