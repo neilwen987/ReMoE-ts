@@ -83,8 +83,8 @@ if __name__ == '__main__':
         print("Interleaved pipeline schedule is not yet supported for downstream tasks.")
         exit()
 
-    if args.task == 'RACE':
-        from race.finetune import main
+    if args.task in ['RACE', 'HELLASWAG','ARC-C','ARC-E']:
+        from zeroshot_gpt.evaluate import main
     elif args.task in ['MNLI', 'QQP']:
         from glue.finetune import main
     elif args.task in ['LAMBADA', 'WIKITEXT103']:

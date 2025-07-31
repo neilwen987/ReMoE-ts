@@ -90,6 +90,7 @@ from .global_vars import (
 from . import one_logger_utils
 
 from . import ft_integration
+from megatron.core.transformer.moe.router import temporary_eval_topk
 
 stimer = StragglerDetector()
 
@@ -1643,7 +1644,8 @@ def evaluate(forward_step_func,
              process_non_loss_data_func,
              config,
              verbose=False,
-             non_loss_data_func=None):
+             non_loss_data_func=None,
+             record_microbatches: bool = False):   # 新增参数
     """Evaluation."""
     args = get_args()
     timers = get_timers()
@@ -1658,10 +1660,15 @@ def evaluate(forward_step_func,
     for model_module in model:
         model_module.eval()
 
-    # Disable result validation during evaluation
+    # 处理 RerunStateMachine 模式
     rerun_state_machine = get_rerun_state_machine()
-    rerun_mode = rerun_state_machine.get_mode()
-    rerun_state_machine.set_mode(RerunMode.DISABLED)
+    original_rerun_mode = rerun_state_machine.get_mode()
+    if record_microbatches:
+        # 只要不是 DISABLED 即可触发缓存
+        if original_rerun_mode == RerunMode.DISABLED:
+            rerun_state_machine.set_mode(RerunMode.REPORT_DETERMINISM_STATS)
+    else:
+        rerun_state_machine.set_mode(RerunMode.DISABLED)
 
     total_loss_dict = {}
 
@@ -1722,7 +1729,7 @@ def evaluate(forward_step_func,
                     done_cuda, op=torch.distributed.ReduceOp.MAX)
                 done = done_cuda.item()
                 if done:
-                    rerun_state_machine.set_mode(rerun_mode)
+                    rerun_state_machine.set_mode(original_rerun_mode)
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
 
@@ -1752,7 +1759,7 @@ def evaluate(forward_step_func,
     timers('evaluate').stop()
     timers.log(['evaluate'])
     
-    rerun_state_machine.set_mode(rerun_mode)
+    rerun_state_machine.set_mode(original_rerun_mode)
 
     return total_loss_dict, collected_non_loss_data, False
 
@@ -1769,36 +1776,69 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
-        forward_step_func, data_iterator, model,
-        process_non_loss_data_func, config, verbose, non_loss_data_func)
-    # Timelimit hit during evaluation
-    if timelimit:
-        return
+    eval_topks = getattr(args, 'moe_router_eval_topk', args.moe_router_topk)
+    if not isinstance(eval_topks, list):
+        eval_topks = [eval_topks]
+
+    results = {}
+    first_eval = True
+
+    for idx, eval_topk in enumerate(eval_topks):
+        print_rank_0(f'Evaluating with top-{eval_topk} routing...')
+
+        # 第二轮开始复用第一轮缓存的数据
+        if idx > 0 and hasattr(data_iterator, "rewind"):
+            data_iterator.rewind()
+
+        with temporary_eval_topk(model, eval_topk):
+            total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+                forward_step_func,
+                data_iterator,
+                model,
+                process_non_loss_data_func,
+                config,
+                verbose,
+                non_loss_data_func,
+                record_microbatches=first_eval)   # 首轮记录
+        first_eval = False
+
+        # Timelimit hit during evaluation
+        if timelimit:
+            return
+            
+        results[f'top_{eval_topk}'] = total_loss_dict
+
+    # 评估结束，丢弃缓存，继续向前读
+    if hasattr(data_iterator, "advance"):
+        data_iterator.advance()
+
+    # 打印所有结果
     string = f' validation loss at {prefix} | '
-    for key in total_loss_dict:
-        string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-        ppl = math.exp(min(20, total_loss_dict[key].item()))
-        string += '{} PPL: {:.6E} | '.format(key, ppl)
-        if writer:
-            writer.add_scalar('{} validation'.format(key),
-                              total_loss_dict[key].item(),
-                              iteration)
-            writer.add_scalar('{} validation vs samples'.format(key),
-                              total_loss_dict[key].item(),
-                              args.consumed_train_samples)
-            if args.log_validation_ppl_to_tensorboard:
-                writer.add_scalar('{} validation ppl'.format(key), ppl,
+    for topk_name, loss_dict in results.items():
+        for key in loss_dict:
+            string += f'{topk_name} {key} value: {loss_dict[key].item():.6E} | '
+            ppl = math.exp(min(20, loss_dict[key].item()))
+            string += f'{topk_name} {key} PPL: {ppl:.6E} | '
+            
+            if writer:
+                writer.add_scalar(f'{topk_name} {key} validation',
+                                  loss_dict[key].item(),
                                   iteration)
-                writer.add_scalar('{} validation ppl vs samples'.format(key),
-                                  ppl, args.consumed_train_samples)
+                writer.add_scalar(f'{topk_name} {key} validation vs samples',
+                                  loss_dict[key].item(),
+                                  args.consumed_train_samples)
+                if args.log_validation_ppl_to_tensorboard:
+                    writer.add_scalar(f'{topk_name} {key} validation ppl', ppl,
+                                      iteration)
+                    writer.add_scalar(f'{topk_name} {key} validation ppl vs samples',
+                                      ppl, args.consumed_train_samples)
             if wandb_writer:
                 # 处理loss_dict中的tuple格式 (loss_value, num_tokens)
-                if isinstance(total_loss_dict[key], tuple):
-                    loss_value = total_loss_dict[key][0]  # 取tuple的第一个元素（实际的loss值）
+                if isinstance(loss_dict[key], tuple):
+                    loss_value = loss_dict[key][0]  # 取tuple的第一个元素（实际的loss值）
                 else:
-                    loss_value = total_loss_dict[key]
-                wandb_writer.log({key: loss_value}, iteration)
+                    loss_value = loss_dict[key]
+                wandb_writer.log({f'{topk_name}_{key}': loss_value}, iteration)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
@@ -1918,7 +1958,7 @@ def build_train_valid_test_data_iterators(
     # Build iterators.
     dl_type = args.dataloader_type
     assert dl_type in ['single', 'cyclic', 'external']
-
+ 
     def _get_iterator(dataloader_type, dataloader):
         """Return dataset iterator."""
         if dataloader_type == "single":

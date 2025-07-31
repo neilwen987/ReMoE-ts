@@ -18,6 +18,31 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+import contextlib
+
+@contextlib.contextmanager
+def temporary_eval_topk(model, eval_topk: int):
+    """Temporarily set evaluation top-k for all MoE layers."""
+    original_topks = []
+    
+    # 保存并设置新的top-k值
+    for model_module in model:
+        for layer in model_module.modules():
+            if hasattr(layer, 'router') and hasattr(layer.router, 'set_eval_topk'):
+                original_topks.append(layer.router.topk)
+                layer.router.set_eval_topk(eval_topk)
+    
+    try:
+        yield
+    finally:
+        # 恢复原始top-k值
+        topk_idx = 0
+        for model_module in model:
+            for layer in model_module.modules():
+                if hasattr(layer, 'router') and hasattr(layer.router, 'set_eval_topk'):
+                    layer.router.set_eval_topk(original_topks[topk_idx])
+                    topk_idx += 1
+
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -101,6 +126,17 @@ class TopKRouter(Router):
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.input_jitter = None
+        self.eval_topk = getattr(config, 'moe_router_eval_topk', self.topk)
+    
+    def get_current_topk(self):
+        if self.training:
+            return self.topk
+        else:
+            return self.eval_topk
+    
+    def set_eval_topk(self, eval_topk:int):
+        self.eval_topk = eval_topk
+
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -112,9 +148,9 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
             probabilities and mask.
         """
-
+        current_topk = self.get_current_topk()
         def _sinkhorn_activation(logits):
-            if self.topk == 1:
+            if current_topk == 1:
                 logits = torch.sigmoid(logits)
             else:  # k > 1
                 logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
@@ -126,11 +162,11 @@ class TopKRouter(Router):
                 norm_logits = sinkhorn(
                     logits.to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
-                _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
+                _, indices = torch.topk(norm_logits, k=current_topk, dim=1)
             logits = _sinkhorn_activation(logits)
         else:
             logits = _sinkhorn_activation(logits)
-            _, indices = torch.topk(logits, k=self.topk, dim=1)
+            _, indices = torch.topk(logits, k=current_topk, dim=1)
         map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
         scores = logits * map
         return scores, map
@@ -145,9 +181,10 @@ class TopKRouter(Router):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             indices (torch.Tensor): The mask of token to experts assignment.
         """
+        current_topk = self.get_current_topk()
         probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
             logits,
-            self.topk,
+            current_topk,
             capacity_factor=self.config.moe_expert_capacity_factor,
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
@@ -273,9 +310,10 @@ class TopKRouter(Router):
             scores, routing_map = self.aux_loss_load_balancing(logits)
         elif self.routing_type == "none":
             # A naive top-k routing without load balancing
+            current_topk = self.get_current_topk()
             scores, routing_map, _ = topk_softmax_with_capacity(
                 logits,
-                self.topk,
+                current_topk,
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
@@ -460,9 +498,10 @@ class SampleTopKRouter(TopKRouter):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             indices (torch.Tensor): The mask of token to experts assignment.
         """
+        current_topk = self.get_current_topk()
         probs, routing_map, tokens_per_expert = sp_topk_softmax_with_capacity(
             logits,
-            self.topk,
+            current_topk,
             batch_size = B,
             Seq_length = S,
             capacity_factor=self.config.moe_expert_capacity_factor,

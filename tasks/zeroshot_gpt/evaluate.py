@@ -7,6 +7,7 @@ import os, json                    # 新增
 from tqdm import tqdm              # ── 新增
 
 import torch
+from datasets import load_dataset, load_from_disk  # 新增
 
 from megatron.training import get_args
 from megatron.training import print_rank_0, is_last_rank
@@ -110,6 +111,86 @@ def _evaluate_race(model, tokenizer, race_root, split="test"):
 
     for sample in sample_iter:
         if _predict_race_sample(model, tokenizer, eod_id, sample,) == sample["label"]:
+            correct += 1
+        total += 1
+
+    # 汇总到 data-parallel group
+    torch.distributed.all_reduce(correct)
+    torch.distributed.all_reduce(total)
+    acc = (correct / total).item() if total.item() > 0 else 0.0
+    return acc
+
+#######################################
+# ---------  ARC 工具函数 ---------
+#######################################
+
+def _iter_arc_samples(root, subset):
+    """遍历保存到磁盘的 ARC 数据集。
+
+    参数
+    -----
+    root: str
+        使用 `tasks/data/get_arc.py` 保存的目录
+    subset: str
+        ARC子集 ('arc-e' 或 'arc-c')
+    产出
+    -----
+    dict
+        {"question": str, "choices": [c0,c1,c2,c3], "label": int}
+    """
+    try:
+        # 构建文件路径
+        file_path = os.path.join(root, f"{subset}.json")
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Cannot locate ARC file: {file_path}")
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"加载 ARC 数据集失败: {e}")
+
+    for item in dataset:
+        question = item["question"]
+        choices = item["choices"]
+        answer_key = item["answerKey"]
+        
+        # 将答案key转换为数字标签 (A->0, B->1, C->2, D->3)
+        label = ord(answer_key) - ord("A")
+        
+        yield {"question": question, "choices": choices, "label": label}
+
+
+def _predict_arc_sample(model, tokenizer, eod_id, sample, max_ctx=1024):
+    """预测单个ARC样本的答案"""
+    question = sample["question"]
+    choices = sample["choices"]
+    
+    # 构建prompt格式
+    prefix = f"Question: {question}\nAnswer:"
+    prefix_ids = tokenizer.tokenize(prefix)[-max_ctx:]
+
+    scores = []
+    for choice in choices:
+        choice_ids = tokenizer.tokenize(" " + choice)
+        scores.append(_choice_score(model, prefix_ids, choice_ids, eod_id))
+    
+    return int(max(range(len(choices)), key=lambda i: scores[i]))
+
+
+def _evaluate_arc(model, tokenizer, root, subset="arc-e"):
+    """评估ARC数据集"""
+    model.eval()
+    eod_id = tokenizer.eod
+    correct = torch.tensor(0.0, device="cuda")
+    total = torch.tensor(0.0, device="cuda")
+    sample_iter = _iter_arc_samples(root, subset)
+    
+    # 仅在最后一个 rank 上显示进度条
+    if is_last_rank():
+        sample_iter = tqdm(sample_iter, desc=f'ARC-{subset}')
+
+    for sample in sample_iter:
+        if _predict_arc_sample(model, tokenizer, eod_id, sample) == sample["label"]:
             correct += 1
         total += 1
 
@@ -340,7 +421,11 @@ def main():
         eval_metric = 'accuracy'
     elif args.task == 'WIKITEXT103':
         eval_metric = 'loss'
-    elif args.task == 'RACE':                # 新增分支
+    elif args.task == 'RACE':
+        eval_metric = 'accuracy'
+    elif args.task == 'ARC-E':           # 新增分支
+        eval_metric = 'accuracy'
+    elif args.task == 'ARC-C':           # 新增分支
         eval_metric = 'accuracy'
     else:
         raise NotImplementedError('{} task is not implemented.'.format(
@@ -357,13 +442,23 @@ def main():
     # -------------------- RACE 路径 --------------------
     if args.task == 'RACE':
         tokenizer = get_tokenizer()
-        # RACE 根目录默认取 valid_data[0]；若未提供则假设 ./RACE
         race_root = args.valid_data[0] if args.valid_data else './RACE'
         eval_split = 'test'
         acc = _evaluate_race(model, tokenizer, race_root, split=eval_split)
         if is_last_rank():
             print_rank_0(f'RACE {eval_split} accuracy: {acc:.4%}')
-    # ---------------- 其余零 shot 任务 -----------------
+    elif args.task == 'ARC-E':           # 新增分支
+        tokenizer = get_tokenizer()
+        arc_root = args.valid_data[0] if args.valid_data else './ARC'
+        acc = _evaluate_arc(model, tokenizer, arc_root, subset='ARC-Easy')
+        if is_last_rank():
+            print_rank_0(f'ARC-E accuracy: {acc:.4%}')
+    elif args.task == 'ARC-C':           # 新增分支
+        tokenizer = get_tokenizer()
+        arc_root = args.valid_data[0] if args.valid_data else './ARC'
+        acc = _evaluate_arc(model, tokenizer, arc_root, subset='ARC-Challenge')
+        if is_last_rank():
+            print_rank_0(f'ARC-C accuracy: {acc:.4%}')
     else:
         dataset = build_dataset(args.task)
         dataloader = build_data_loader(dataset, args.micro_batch_size,

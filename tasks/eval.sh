@@ -2,17 +2,22 @@
 # evaluate_all_tasks.sh
 
 # 设置环境变量
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=3
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MASTER_ADDR=localhost
-export MASTER_PORT=29507
+export MASTER_PORT=29582
 
 # 模型和数据路径
+# /home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/logs/MOE-Topk-182M-0723-183105
+# /home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/logs/MOE-SPTopk-182M-0725-003932
+# /home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/logs/MOE-SPTopk-G8-182M-0726-042101
 MODEL_PATH="/home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/logs/MOE-SPTopk-182M-0725-003932"
 LAMBADA_DATA="/home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/tasks/data/lambada_test.jsonl"
 MNLI_DATA="/path/to/mnli_dev.tsv"
 QQP_DATA="/path/to/qqp_dev.tsv"
 RACE_DATA="/home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/tasks/data/RACE"
+ARC_E_DATA="/home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/tasks/data/arc/ARC-Easy"
+ARC_C_DATA="/home/ubuntu/tiansheng/26_ICLR_btk_moe/ReMoE-ts/tasks/data/arc/ARC-Challenge"
 
 # MOE配置参数（与训练时保持一致）
 NUM_EXPERTS=8
@@ -49,7 +54,7 @@ MODEL_ARGS="\
 --no-load-optim \
 --no-load-rng"
 
-# MOE特定参数  
+# MOE特定参数    --moe-sample-routing \
 MOE_ARGS="\
 --num-experts $NUM_EXPERTS \
 --moe-router-topk $NUM_TOPK \
@@ -92,11 +97,11 @@ echo "MOE Configuration: $NUM_EXPERTS experts, top-$NUM_TOPK routing, granularit
 #     $MOE_ARGS \
 #     $MODEL_PARALLEL_ARGS 2>&1 | tee lambada_eval.log
 
-# 2. MNLI评估
-# echo "2. Evaluating MNLI..."
+# 2. RACE评估
+# echo "2. Evaluating RACE..."
 # python main.py \
-#     --task MNLI \
-#     --valid-data $MNLI_DATA \
+#     --task RACE \
+#     --valid-data $RACE_DATA \
 #     --load $MODEL_PATH \
 #     --epochs 0 \
 #     --seq-length 1024 \
@@ -105,24 +110,10 @@ echo "MOE Configuration: $NUM_EXPERTS experts, top-$NUM_TOPK routing, granularit
 #     $MOE_ARGS \
 #     $MODEL_PARALLEL_ARGS
 
-# 3. QQP评估
-# echo "3. Evaluating QQP..."
-# python tasks/main.py \
-#     --task QQP \
-#     --valid-data $QQP_DATA \
-#     --load $MODEL_PATH \
-#     --epochs 0 \
-#     --seq-length 1024 \
-#     --micro-batch-size 8 \
-#     $MODEL_ARGS \
-#     $MOE_ARGS \
-#     $MODEL_PARALLEL_ARGS
-
-# 4. RACE评估
-echo "4. Evaluating RACE..."
+# echo "3. Evaluating ARC-C..."
 python main.py \
-    --task RACE \
-    --valid-data $RACE_DATA \
+    --task ARC-C \
+    --valid-data $ARC_C_DATA \
     --load $MODEL_PATH \
     --epochs 0 \
     --seq-length 1024 \
@@ -130,5 +121,17 @@ python main.py \
     $MODEL_ARGS \
     $MOE_ARGS \
     $MODEL_PARALLEL_ARGS
+
+# echo "4. Evaluating ARC-E..."
+# python main.py \
+#     --task ARC-E \
+#     --valid-data $ARC_E_DATA \
+#     --load $MODEL_PATH \
+#     --epochs 0 \
+#     --seq-length 1024 \
+#     --micro-batch-size 8 \
+#     $MODEL_ARGS \
+#     $MOE_ARGS \
+#     $MODEL_PARALLEL_ARGS
 
 echo "=== Zero-shot Evaluation Complete ==="

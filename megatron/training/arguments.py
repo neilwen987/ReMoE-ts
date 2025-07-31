@@ -2135,6 +2135,9 @@ def _add_moe_args(parser):
     # Sample Top-k arguments
     group.add_argument('--moe-sample-routing', action='store_true',
                    help='Use Sample Top-k routing for MoE.')
+    group.add_argument('--moe-router-eval-topk', type=int,nargs='+', default=None,
+                       help='Number of experts to route to for each token during evaluation. '
+                       'If not set, uses the same value as --moe-router-topk.')
 
     return parser
 

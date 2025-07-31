@@ -90,3 +90,9 @@ If you find this work useful, please consider citing:
       year={2024}
 }
 ```
+
+
+### Reproduce README
+1. torch <= 2.4.0 
+2. handle apex conflicts
+3. run cudnn.sh 
